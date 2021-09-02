@@ -1,10 +1,6 @@
-use std::{
-    cmp::Ordering,
-    collections::HashSet,
-    fs::File,
-    io::{BufRead, BufReader},
-    path::PathBuf,
-};
+use color_eyre::eyre::Context;
+use sha2::{Digest, Sha256};
+use std::{cmp::Ordering, collections::HashSet, fs::OpenOptions, io::Write, path::PathBuf};
 use structopt::StructOpt;
 
 use crate::sqlite;
@@ -14,6 +10,8 @@ pub struct Args {
     #[structopt(flatten)]
     database: sqlite::Args,
     list: PathBuf,
+    #[structopt(long, short = "o")]
+    save_on_error: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -62,33 +60,123 @@ fn choose_correct_card(
     });
 
     println!("Multiple matches:");
-    for (idx, card) in cards.iter().enumerate() {
-        println!(
-            "  - [{}] {} - {} ({})",
-            idx + 1,
-            card.name,
-            card.set,
-            card.uri
-        );
-    }
+    let mut iterator = cards.iter().enumerate();
+    let mut remaining = cards.len();
+    let mut show = true;
     loop {
-        let value: usize = promptly::prompt("Correct card ?")?;
-        if value == 0 || value > cards.len() {
-            continue;
+        if show {
+            for (idx, card) in iterator.by_ref().take(10) {
+                println!(
+                    "  - [{}] {} - {} ({})",
+                    idx + 1,
+                    card.name,
+                    card.set,
+                    card.uri
+                );
+                remaining -= 1;
+            }
+            show = false;
         }
-        let value = cards.into_iter().nth(value - 1).unwrap();
-        sorting_ctx.chosen.insert(value.id.clone());
-        return Ok(value);
+        let text = if remaining == 0 {
+            "Correct card ?"
+        } else {
+            "Correct card (0 for more choices)?"
+        };
+        let value: usize = promptly::prompt(text)?;
+        if value > cards.len() {
+            continue;
+        } else if value == 0 {
+            show = true;
+        } else {
+            let value = cards.into_iter().nth(value - 1).unwrap();
+            sorting_ctx.chosen.insert(value.id.clone());
+            return Ok(value);
+        }
     }
 }
 
 impl Args {
     pub fn add_list(self) -> color_eyre::Result<()> {
+        let card_list = std::fs::read_to_string(&self.list)?;
+
+        let mut card_iter = card_list.lines().peekable();
+        let card_uid: Vec<u8>;
+        match card_iter.peek() {
+            Some(l) if l.starts_with("uid=") => {
+                let uid = card_iter.next().unwrap().strip_prefix("uid=").unwrap();
+                card_uid = hex::decode(uid).wrap_err("could not decode uid")?;
+            }
+            _ => {
+                let mut card_hasher = Sha256::new();
+                card_hasher.update(&card_list);
+                let card_hash = card_hasher.finalize();
+                card_uid = card_hash.to_vec();
+            }
+        }
+
+        match self.save_on_error {
+            None => self.add_list_priv(card_iter, &card_uid, |_, _| Ok(())),
+            Some(ref p) => {
+                let mut out = OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(p)?;
+                writeln!(out, "uid={}", hex::encode(&card_uid))?;
+                let mut was_writing = None;
+                let list = self.add_list_priv(
+                    card_iter.by_ref().inspect(|&line| was_writing = Some(line)),
+                    &card_uid,
+                    |id, foil| {
+                        writeln!(out, "[id]{}{}", if foil { "[F]" } else { "" }, id)
+                            .map(|_| ())
+                            .map_err(Into::into)
+                    },
+                );
+                if list.is_err() {
+                    was_writing
+                        .into_iter()
+                        .chain(card_iter)
+                        .try_for_each(|card| writeln!(out, "{}", card))?;
+                }
+                list
+            }
+        }
+    }
+
+    fn add_list_priv<'a, I, F>(
+        &self,
+        cards: I,
+        card_uid: &[u8],
+        mut added_card: F,
+    ) -> color_eyre::Result<()>
+    where
+        I: Iterator<Item = &'a str>,
+        F: FnMut(&str, bool) -> color_eyre::Result<()>,
+    {
         let mut db = self.database.spellfix_connection()?;
 
-        let card_list = BufReader::new(File::open(&self.list)?);
-
         db.execute("CREATE TABLE IF NOT EXISTS cards (id TEXT NOT NULL, foil BOOLEAN NOT NULL DEFAULT false, amount INTEGER NOT NULL, PRIMARY KEY (id, foil))", [])?;
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS lists (hash BLOB PRIMARY KEY NOT NULL)",
+            [],
+        )?;
+
+        let has_hash: usize = db.query_row(
+            "SELECT COUNT(*) FROM lists WHERE hash = ?1",
+            [card_uid],
+            |row| row.get(0),
+        )?;
+
+        if has_hash > 0 {
+            let cont: bool = promptly::prompt_default(
+                "This list was already added, do you want to continue",
+                false,
+            )?;
+            if cont == false {
+                return Ok(());
+            }
+        }
 
         let tx = db.transaction()?;
 
@@ -103,62 +191,112 @@ impl Args {
         let mut eng_error = tx.prepare("SELECT name,id,uri,set_name,promo FROM scryfall WHERE name IN (SELECT word FROM card_names WHERE word MATCH ?1);")?;
         let mut similar = tx.prepare("SELECT word FROM card_names WHERE word MATCH ?1")?;
 
+        let mut duo = tx.prepare(
+            r#"
+            SELECT 
+                search.name,search.id,uri,set_name,promo
+            FROM scryfall,
+            (
+                SELECT 
+                    fn1.id as id,
+                    (f1.score + f2.score)/2 as score,
+                    fn1.name || ' // ' || fn2.name as name
+                FROM 
+                    face_names as f1,
+                    scryfall_faces as fn1,
+                    scryfall_faces as fn2,
+                    face_names as f2 
+                WHERE 
+                    f1.word MATCH ?1
+                    AND fn1.name = f1.word 
+                    AND f2.word MATCH ?2
+                    AND fn2.name = f2.word 
+                    AND fn2.name != fn1.name 
+                    AND fn1.id = fn2.id
+                ORDER BY score
+            ) as search 
+            WHERE 
+                search.id = scryfall.id 
+            ORDER BY 
+                search.score"#,
+        )?;
+
         let mut chosen = HashSet::new();
 
-        for card in card_list.lines() {
-            let card = card?;
-            let (foil, name) = match card.strip_prefix("[F]") {
-                None => (false, card.as_str()),
-                Some(card) => (true, card),
-            };
+        for card in cards {
+            let (foil, id) = match card.strip_prefix("[id]") {
+                Some(id) => match id.strip_prefix("[F]") {
+                    None => (false, id.to_string()),
+                    Some(id) => (true, id.to_string()),
+                },
+                None => {
+                    let (foil, name) = match card.strip_prefix("[F]") {
+                        None => (false, card),
+                        Some(card) => (true, card),
+                    };
 
-            let parse_row = |row: &rusqlite::Row| -> rusqlite::Result<_> {
-                Ok(CardInfo {
-                    name: row.get(0)?,
-                    id: row.get(1)?,
-                    uri: row.get(2)?,
-                    set: row.get(3)?,
-                    promo: row.get(4)?,
-                })
-            };
+                    let parse_row = |row: &rusqlite::Row| -> rusqlite::Result<_> {
+                        Ok(CardInfo {
+                            name: row.get(0)?,
+                            id: row.get(1)?,
+                            uri: row.get(2)?,
+                            set: row.get(3)?,
+                            promo: row.get(4)?,
+                        })
+                    };
 
-            let names: Vec<CardInfo> = printed
-                .query_map([name], &parse_row)?
-                .chain(eng.query_map([name], &parse_row)?)
-                .collect::<Result<_, _>>()?;
+                    let names: Vec<CardInfo>;
+                    if let Some(p) = name.find("//") {
+                        let (first, second) = name.split_at(p);
+                        let first = first.trim();
+                        let second = (&second[2..]).trim();
+                        names = duo
+                            .query_map([first, second], &parse_row)?
+                            .collect::<Result<_, _>>()?;
+                    } else {
+                        names = printed
+                            .query_map([name], &parse_row)?
+                            .chain(eng.query_map([name], &parse_row)?)
+                            .collect::<Result<_, _>>()?;
+                    }
 
-            let id = match names.len() {
-                0 => {
-                    println!("{} was not found, possible choices:", name);
-                    let corrections: Vec<CardInfo> = printed_error
-                        .query_map([name], &parse_row)?
-                        .chain(eng_error.query_map([name], &parse_row)?)
-                        .collect::<Result<_, _>>()?;
+                    let id = match names.len() {
+                        0 => {
+                            println!("{} was not found, possible choices:", name);
+                            let corrections: Vec<CardInfo> = printed_error
+                                .query_map([name], &parse_row)?
+                                .chain(eng_error.query_map([name], &parse_row)?)
+                                .collect::<Result<_, _>>()?;
 
-                    let similar = similar
-                        .query_map([name], |row| row.get(0))?
-                        .collect::<Result<_, _>>()?;
-                    choose_correct_card(
-                        corrections,
-                        SortingCtx {
-                            similar,
-                            chosen: &mut chosen,
-                        },
-                    )?
-                    .id
+                            let similar = similar
+                                .query_map([name], |row| row.get(0))?
+                                .collect::<Result<_, _>>()?;
+                            choose_correct_card(
+                                corrections,
+                                SortingCtx {
+                                    similar,
+                                    chosen: &mut chosen,
+                                },
+                            )?
+                            .id
+                        }
+                        1 => names.into_iter().next().unwrap().id,
+                        _ => {
+                            choose_correct_card(
+                                names,
+                                SortingCtx {
+                                    similar: Vec::new(),
+                                    chosen: &mut chosen,
+                                },
+                            )?
+                            .id
+                        }
+                    };
+                    (foil, id)
                 }
-                1 => names.into_iter().next().unwrap().id,
-                _ => {
-                    choose_correct_card(
-                        names,
-                        SortingCtx {
-                            similar: Vec::new(),
-                            chosen: &mut chosen,
-                        },
-                    )?
-                    .id
-                }
             };
+
+            added_card(&id, foil)?;
 
             let is_present: usize = tx.query_row(
                 "SELECT COUNT(*) FROM cards WHERE id = ?1 AND foil = ?2",
@@ -178,11 +316,14 @@ impl Args {
             }
         }
 
+        tx.execute("INSERT INTO lists (hash) VALUES (?1)", [card_uid])?;
+
         drop(printed);
         drop(eng);
         drop(printed_error);
         drop(eng_error);
         drop(similar);
+        drop(duo);
         tx.commit()?;
 
         Ok(())

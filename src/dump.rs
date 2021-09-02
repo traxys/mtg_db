@@ -22,6 +22,14 @@ struct Card {
     promo: bool,
     prices: Price,
     variation: bool,
+    #[serde(default)]
+    card_faces: Vec<CardFace>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct CardFace {
+    name: String,
+    printed_name: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -39,10 +47,19 @@ pub struct Args {
 
 impl Args {
     pub fn dump_scryfall(self) -> color_eyre::Result<()> {
-        let attach_str = format!("ATTACH '{}' as sc; BEGIN; INSERT INTO sc.scryfall SELECT * FROM scryfall; COMMIT; DETACH sc;", self.database.database.to_string_lossy());
+        let attach_str = format!(
+            r#"ATTACH '{}' as sc; 
+            BEGIN; 
+            INSERT INTO sc.scryfall SELECT * FROM scryfall; 
+            INSERT INTO sc.scryfall_faces SELECT * FROM scryfall_faces;
+            COMMIT; 
+            DETACH sc;"#,
+            self.database.database.to_string_lossy()
+        );
 
         let sc = &self.database.spellfix_connection()?;
         sc.execute("DROP TABLE IF EXISTS scryfall;", [])?;
+
         let table = r#"CREATE TABLE scryfall (
             id TEXT PRIMARY KEY NOT NULL, 
             name TEXT NOT NULL, 
@@ -53,8 +70,11 @@ impl Args {
             set_name TEXT NOT NULL,
             promo BOOLEAN NOT NULL,
             variation BOOLEAN NOT NULL);"#;
-
         sc.execute(&table, [])?;
+        sc.execute("DROP TABLE IF EXISTS scryfall_faces;", [])?;
+
+        let face_table = "CREATE TABLE scryfall_faces (id TEXT NOT NULL, name TEXT NOT NULL, PRIMARY KEY (id, name));";
+        sc.execute(face_table, [])?;
 
         println!("Creating scryfall databases:");
         let mut input = BufReader::new(File::open(&self.scryfall_jsonl)?).lines();
@@ -70,6 +90,7 @@ impl Args {
             || {
                 let con = Connection::open_in_memory().expect("could not open in memory");
                 con.execute(&table, []).expect("could not create schema");
+                con.execute(&face_table, []).expect("Could not create face schema");
                 con
             },
             |con, card| -> color_eyre::Result<_> {
@@ -89,6 +110,12 @@ impl Args {
                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
                     rusqlite::params![card.id, name, printed_name, card.prices.eur, card.prices.eur_foil, card.scryfall_uri, card.set_name, card.promo, card.variation],
                 )?;
+
+                for face in card.card_faces {
+                    let face_name = deunicode::deunicode(face.printed_name.as_ref().unwrap_or(&face.name)).to_ascii_lowercase();
+                    con.execute("INSERT OR IGNORE INTO scryfall_faces (id, name) VALUES (?1, ?2)", [&card.id, &face_name])?;
+                }
+
                 Ok(con)
             },
         ).collect::<color_eyre::Result<_>>()?;
@@ -102,9 +129,12 @@ impl Args {
         println!("Creating vocabulary:");
         sc.execute_batch(r#"
                          DROP TABLE IF EXISTS card_names;
+                         DROP TABLE IF EXISTS face_names;
                          CREATE VIRTUAL TABLE card_names USING spellfix1;
+                         CREATE VIRTUAL TABLE face_names USING spellfix1;
                          INSERT INTO card_names(word) SELECT DISTINCT printed_name FROM scryfall WHERE printed_name IS NOT NULL;
                          INSERT INTO card_names(word) SELECT DISTINCT name FROM scryfall;
+                         INSERT INTO face_names(word) SELECT DISTINCT name FROM scryfall_faces;
                          "#)?;
 
         Ok(())
