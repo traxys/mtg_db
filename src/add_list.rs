@@ -21,45 +21,50 @@ struct CardInfo {
     name: String,
     id: String,
     uri: String,
+    score: usize,
 }
 
-struct SortingCtx<'a> {
-    similar: Vec<String>,
-    chosen: &'a mut HashSet<String>,
-}
-
-impl SortingCtx<'_> {
-    fn idx(&self, name: &str) -> Option<usize> {
-        self.similar
-            .iter()
-            .enumerate()
-            .find(|(_, n)| n.as_str() == name)
-            .map(|(idx, _)| idx)
-    }
+struct SortingCtx {
+    chosen: HashSet<String>,
+    chosen_set: HashSet<String>,
 }
 
 fn choose_correct_card(
+    choice: &str,
     mut cards: Vec<CardInfo>,
-    sorting_ctx: SortingCtx,
+    sorting_ctx: &mut SortingCtx,
 ) -> color_eyre::Result<CardInfo> {
-    cards.sort_unstable_by(|a, b| {
-        if sorting_ctx.chosen.contains(&a.id) {
-            if sorting_ctx.chosen.contains(&b.id) {
-                return a.name.cmp(&b.name);
-            } else {
-                return Ordering::Less;
-            }
-        } else {
-            match (sorting_ctx.idx(&a.name), sorting_ctx.idx(&b.name)) {
-                (Some(a), Some(b)) => a.cmp(&b),
-                (Some(_), None) => Ordering::Less,
-                (None, Some(_)) => Ordering::Greater,
-                (None, None) => a.name.cmp(&b.name),
-            }
-        }
-    });
+    fn sort_cards(a: &CardInfo, b: &CardInfo) -> Ordering {
+        a.score
+            .cmp(&b.score)
+            .then(a.name.cmp(&b.name).then(a.set.cmp(&b.set)))
+    }
 
-    println!("Multiple matches:");
+    fn sort_on_set(a: &CardInfo, b: &CardInfo, sorting_ctx: &SortingCtx) -> Ordering {
+        match (
+            sorting_ctx.chosen_set.contains(&a.set),
+            sorting_ctx.chosen_set.contains(&b.set),
+        ) {
+            (true, true) | (false, false) => sort_cards(a, b),
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+        }
+    }
+
+    fn sort_on_id(a: &CardInfo, b: &CardInfo, sorting_ctx: &SortingCtx) -> Ordering {
+        match (
+            sorting_ctx.chosen.contains(&a.id),
+            sorting_ctx.chosen.contains(&b.id),
+        ) {
+            (true, true) | (false, false) => sort_on_set(a, b, sorting_ctx),
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+        }
+    }
+
+    cards.sort_unstable_by(|a, b| sort_on_id(a, b, &sorting_ctx));
+
+    println!("Choose match for {}:", choice);
     let mut iterator = cards.iter().enumerate();
     let mut remaining = cards.len();
     let mut show = true;
@@ -67,10 +72,11 @@ fn choose_correct_card(
         if show {
             for (idx, card) in iterator.by_ref().take(10) {
                 println!(
-                    "  - [{}] {} - {} ({})",
+                    "  - [{}] {} - {} [{}]({})",
                     idx + 1,
                     card.name,
                     card.set,
+                    card.score,
                     card.uri
                 );
                 remaining -= 1;
@@ -90,6 +96,7 @@ fn choose_correct_card(
         } else {
             let value = cards.into_iter().nth(value - 1).unwrap();
             sorting_ctx.chosen.insert(value.id.clone());
+            sorting_ctx.chosen_set.insert(value.set.clone());
             return Ok(value);
         }
     }
@@ -156,7 +163,16 @@ impl Args {
     {
         let mut db = self.database.spellfix_connection()?;
 
-        db.execute("CREATE TABLE IF NOT EXISTS cards (id TEXT NOT NULL, foil BOOLEAN NOT NULL DEFAULT false, amount INTEGER NOT NULL, PRIMARY KEY (id, foil))", [])?;
+        db.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS cards (
+                id TEXT NOT NULL,
+                foil BOOLEAN NOT NULL DEFAULT false,
+                amount INTEGER NOT NULL,
+                PRIMARY KEY (id, foil)
+            )"#,
+            [],
+        )?;
         db.execute(
             "CREATE TABLE IF NOT EXISTS lists (hash BLOB PRIMARY KEY NOT NULL)",
             [],
@@ -179,22 +195,63 @@ impl Args {
         }
 
         let tx = db.transaction()?;
-
-        let mut printed = tx.prepare(
-            "SELECT printed_name,id,uri,set_name,promo FROM scryfall WHERE printed_name = ?1",
-        )?;
-        let mut eng = tx.prepare(
-            "SELECT name,id,uri,set_name,promo  FROM scryfall WHERE name = ?1 AND printed_name IS NULL",
-        )?;
-
-        let mut printed_error = tx.prepare("SELECT printed_name,id,uri,set_name,promo FROM scryfall WHERE printed_name IN (SELECT word FROM card_names WHERE word MATCH ?1);")?;
-        let mut eng_error = tx.prepare("SELECT name,id,uri,set_name,promo FROM scryfall WHERE name IN (SELECT word FROM card_names WHERE word MATCH ?1);")?;
-        let mut similar = tx.prepare("SELECT word FROM card_names WHERE word MATCH ?1")?;
-
-        let mut duo = tx.prepare(
-            r#"
+        {
+            let mut direct_match = tx.prepare(
+                r#"
             SELECT 
-                search.name,search.id,uri,set_name,promo
+                printed_name,
+                id,
+                uri,
+                set_name,
+                promo,
+                0 as score 
+            FROM 
+                scryfall 
+            WHERE 
+                printed_name = ?1 
+            UNION 
+            SELECT 
+                name,
+                id,
+                uri,
+                set_name,
+                promo,
+                0 as score 
+            FROM 
+                scryfall 
+            WHERE name = ?1
+                AND printed_name IS NULL;
+        "#,
+            )?;
+
+            let mut match_error = tx.prepare(
+                r#"
+            SELECT 
+                IIF(printed_name IS NULL, name, printed_name) as nm,
+                id,
+                uri,
+                set_name,
+                promo,
+                score 
+            FROM 
+                scryfall,
+                card_names 
+            WHERE 
+                word MATCH ?1
+                AND (
+                    printed_name = word 
+                    OR (
+                        name = word 
+                        AND printed_name IS NULL
+                    )
+                );
+            "#,
+            )?;
+
+            let mut duo = tx.prepare(
+                r#"
+            SELECT 
+                search.name,search.id,uri,set_name,promo,search.score
             FROM scryfall,
             (
                 SELECT 
@@ -216,114 +273,89 @@ impl Args {
                 ORDER BY score
             ) as search 
             WHERE 
-                search.id = scryfall.id 
-            ORDER BY 
-                search.score"#,
-        )?;
+                search.id = scryfall.id;"#,
+            )?;
 
-        let mut chosen = HashSet::new();
-
-        for card in cards {
-            let (foil, id) = match card.strip_prefix("[id]") {
-                Some(id) => match id.strip_prefix("[F]") {
-                    None => (false, id.to_string()),
-                    Some(id) => (true, id.to_string()),
-                },
-                None => {
-                    let (foil, name) = match card.strip_prefix("[F]") {
-                        None => (false, card),
-                        Some(card) => (true, card),
-                    };
-
-                    let parse_row = |row: &rusqlite::Row| -> rusqlite::Result<_> {
-                        Ok(CardInfo {
-                            name: row.get(0)?,
-                            id: row.get(1)?,
-                            uri: row.get(2)?,
-                            set: row.get(3)?,
-                            promo: row.get(4)?,
-                        })
-                    };
-
-                    let names: Vec<CardInfo>;
-                    if let Some(p) = name.find("//") {
-                        let (first, second) = name.split_at(p);
-                        let first = first.trim();
-                        let second = (&second[2..]).trim();
-                        names = duo
-                            .query_map([first, second], &parse_row)?
-                            .collect::<Result<_, _>>()?;
-                    } else {
-                        names = printed
-                            .query_map([name], &parse_row)?
-                            .chain(eng.query_map([name], &parse_row)?)
-                            .collect::<Result<_, _>>()?;
-                    }
-
-                    let id = match names.len() {
-                        0 => {
-                            println!("{} was not found, possible choices:", name);
-                            let corrections: Vec<CardInfo> = printed_error
-                                .query_map([name], &parse_row)?
-                                .chain(eng_error.query_map([name], &parse_row)?)
-                                .collect::<Result<_, _>>()?;
-
-                            let similar = similar
-                                .query_map([name], |row| row.get(0))?
-                                .collect::<Result<_, _>>()?;
-                            choose_correct_card(
-                                corrections,
-                                SortingCtx {
-                                    similar,
-                                    chosen: &mut chosen,
-                                },
-                            )?
-                            .id
-                        }
-                        1 => names.into_iter().next().unwrap().id,
-                        _ => {
-                            choose_correct_card(
-                                names,
-                                SortingCtx {
-                                    similar: Vec::new(),
-                                    chosen: &mut chosen,
-                                },
-                            )?
-                            .id
-                        }
-                    };
-                    (foil, id)
-                }
+            let mut sorting_ctx = SortingCtx {
+                chosen: HashSet::new(),
+                chosen_set: HashSet::new(),
             };
 
-            added_card(&id, foil)?;
+            for card in cards {
+                let (foil, id) = match card.strip_prefix("[id]") {
+                    Some(id) => match id.strip_prefix("[F]") {
+                        None => (false, id.to_string()),
+                        Some(id) => (true, id.to_string()),
+                    },
+                    None => {
+                        let (foil, name) = match card.strip_prefix("[F]") {
+                            None => (false, card),
+                            Some(card) => (true, card),
+                        };
 
-            let is_present: usize = tx.query_row(
-                "SELECT COUNT(*) FROM cards WHERE id = ?1 AND foil = ?2",
-                rusqlite::params![&id, foil],
-                |row| row.get(0),
-            )?;
-            if is_present == 0 {
-                tx.execute(
-                    "INSERT INTO cards (id, foil, amount) VALUES (?1, ?2, 1)",
+                        let parse_row = |row: &rusqlite::Row| -> rusqlite::Result<_> {
+                            Ok(CardInfo {
+                                name: row.get(0)?,
+                                id: row.get(1)?,
+                                uri: row.get(2)?,
+                                set: row.get(3)?,
+                                promo: row.get(4)?,
+                                score: row.get(5)?,
+                            })
+                        };
+
+                        let names: Vec<CardInfo>;
+                        if let Some(p) = name.find("//") {
+                            println!("Handling double card {}", name);
+                            let (first, second) = name.split_at(p);
+                            let first = first.trim();
+                            let second = (&second[2..]).trim();
+                            names = duo
+                                .query_map([first, second], &parse_row)?
+                                .collect::<Result<_, _>>()?;
+                        } else {
+                            names = direct_match
+                                .query_map([name], &parse_row)?
+                                .collect::<Result<_, _>>()?;
+                        }
+
+                        let id = match names.len() {
+                            0 => {
+                                let corrections: Vec<CardInfo> = match_error
+                                    .query_map([name], &parse_row)?
+                                    .collect::<Result<_, _>>()?;
+
+                                choose_correct_card(name, corrections, &mut sorting_ctx)?.id
+                            }
+                            1 => names.into_iter().next().unwrap().id,
+                            _ => choose_correct_card(name, names, &mut sorting_ctx)?.id,
+                        };
+                        (foil, id)
+                    }
+                };
+
+                added_card(&id, foil)?;
+
+                let is_present: usize = tx.query_row(
+                    "SELECT COUNT(*) FROM cards WHERE id = ?1 AND foil = ?2",
                     rusqlite::params![&id, foil],
+                    |row| row.get(0),
                 )?;
-            } else {
-                tx.execute(
-                    "UPDATE cards SET amount = amount + 1 WHERE id = ?1 AND foil = ?2",
-                    rusqlite::params![&id, foil],
-                )?;
+                if is_present == 0 {
+                    tx.execute(
+                        "INSERT INTO cards (id, foil, amount) VALUES (?1, ?2, 1)",
+                        rusqlite::params![&id, foil],
+                    )?;
+                } else {
+                    tx.execute(
+                        "UPDATE cards SET amount = amount + 1 WHERE id = ?1 AND foil = ?2",
+                        rusqlite::params![&id, foil],
+                    )?;
+                }
             }
+
+            tx.execute("INSERT OR IGNORE INTO lists (hash) VALUES (?1)", [card_uid])?;
         }
-
-        tx.execute("INSERT INTO lists (hash) VALUES (?1)", [card_uid])?;
-
-        drop(printed);
-        drop(eng);
-        drop(printed_error);
-        drop(eng_error);
-        drop(similar);
-        drop(duo);
         tx.commit()?;
 
         Ok(())
