@@ -22,6 +22,7 @@ struct Card {
     promo: bool,
     prices: Price,
     variation: bool,
+    keywords: Vec<String>,
     #[serde(default)]
     card_faces: Vec<CardFace>,
 }
@@ -52,13 +53,13 @@ impl Args {
             BEGIN; 
             INSERT INTO sc.scryfall SELECT * FROM scryfall; 
             INSERT INTO sc.scryfall_faces SELECT * FROM scryfall_faces;
+            INSERT INTO sc.scryfall_keywords SELECT * FROM scryfall_keywords;
             COMMIT; 
             DETACH sc;"#,
             self.database.database.to_string_lossy()
         );
 
         let sc = &self.database.spellfix_connection()?;
-        sc.execute("DROP TABLE IF EXISTS scryfall;", [])?;
 
         let table = r#"CREATE TABLE scryfall (
             id TEXT PRIMARY KEY NOT NULL, 
@@ -70,11 +71,16 @@ impl Args {
             set_name TEXT NOT NULL,
             promo BOOLEAN NOT NULL,
             variation BOOLEAN NOT NULL);"#;
+        sc.execute("DROP TABLE IF EXISTS scryfall;", [])?;
         sc.execute(&table, [])?;
-        sc.execute("DROP TABLE IF EXISTS scryfall_faces;", [])?;
 
         let face_table = "CREATE TABLE scryfall_faces (id TEXT NOT NULL, name TEXT NOT NULL, PRIMARY KEY (id, name));";
+        sc.execute("DROP TABLE IF EXISTS scryfall_faces;", [])?;
         sc.execute(face_table, [])?;
+
+        let gameplay_table = "CREATE TABLE scryfall_keywords (id TEXT NOT NULL, keyword NOT NULL, PRIMARY KEY (id, keyword));";
+        sc.execute("DROP TABLE IF EXISTS scryfall_keywords;", [])?;
+        sc.execute(gameplay_table, [])?;
 
         println!("Creating scryfall databases:");
         let mut input = BufReader::new(File::open(&self.scryfall_jsonl)?).lines();
@@ -91,6 +97,7 @@ impl Args {
                 let con = Connection::open_in_memory().expect("could not open in memory");
                 con.execute(&table, []).expect("could not create schema");
                 con.execute(&face_table, []).expect("Could not create face schema");
+                con.execute(&gameplay_table, []).expect("Could not create keyword schema");
                 con
             },
             |con, card| -> color_eyre::Result<_> {
@@ -110,6 +117,10 @@ impl Args {
                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
                     rusqlite::params![card.id, name, printed_name, card.prices.eur, card.prices.eur_foil, card.scryfall_uri, card.set_name, card.promo, card.variation],
                 )?;
+
+                for keyword in  card.keywords {
+                    con.execute("INSERT OR IGNORE INTO scryfall_keywords (id, keyword) VALUES (?1, ?2)", [&card.id, &keyword])?;
+                }
 
                 for face in card.card_faces {
                     let face_name = deunicode::deunicode(face.printed_name.as_ref().unwrap_or(&face.name)).to_ascii_lowercase();
