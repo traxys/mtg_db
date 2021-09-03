@@ -22,6 +22,7 @@ struct Card {
     promo: bool,
     prices: Price,
     variation: bool,
+    mana_cost: Option<String>,
     keywords: Vec<String>,
     #[serde(default)]
     card_faces: Vec<CardFace>,
@@ -31,6 +32,7 @@ struct Card {
 struct CardFace {
     name: String,
     printed_name: Option<String>,
+    mana_cost: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -54,6 +56,7 @@ impl Args {
             INSERT INTO sc.scryfall SELECT * FROM scryfall; 
             INSERT INTO sc.scryfall_faces SELECT * FROM scryfall_faces;
             INSERT INTO sc.scryfall_keywords SELECT * FROM scryfall_keywords;
+            INSERT INTO sc.scryfall_mana SELECT * FROM scryfall_mana;
             COMMIT; 
             DETACH sc;"#,
             self.database.database.to_string_lossy()
@@ -82,6 +85,10 @@ impl Args {
         sc.execute("DROP TABLE IF EXISTS scryfall_keywords;", [])?;
         sc.execute(gameplay_table, [])?;
 
+        let mana_table = "CREATE TABLE scryfall_mana (id TEXT NOT NULL, face INTEGER NOT NULL,cost TEXT NOT NULL, PRIMARY KEY (id, face))";
+        sc.execute("DROP TABLE IF EXISTS scryfall_mana;", [])?;
+        sc.execute(mana_table, [])?;
+
         println!("Creating scryfall databases:");
         let mut input = BufReader::new(File::open(&self.scryfall_jsonl)?).lines();
         let count = input
@@ -98,6 +105,7 @@ impl Args {
                 con.execute(&table, []).expect("could not create schema");
                 con.execute(&face_table, []).expect("Could not create face schema");
                 con.execute(&gameplay_table, []).expect("Could not create keyword schema");
+                con.execute(&mana_table, []).expect("Could not create mana schema");
                 con
             },
             |con, card| -> color_eyre::Result<_> {
@@ -113,18 +121,23 @@ impl Args {
                         });
 
                 con.execute(
-                    r#"INSERT OR IGNORE INTO scryfall (id, name, printed_name, eur, eur_foil, uri, set_name, promo, variation) 
+                    r#"INSERT OR REPLACE INTO scryfall (id, name, printed_name, eur, eur_foil, uri, set_name, promo, variation) 
                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
                     rusqlite::params![card.id, name, printed_name, card.prices.eur, card.prices.eur_foil, card.scryfall_uri, card.set_name, card.promo, card.variation],
                 )?;
 
-                for keyword in  card.keywords {
-                    con.execute("INSERT OR IGNORE INTO scryfall_keywords (id, keyword) VALUES (?1, ?2)", [&card.id, &keyword])?;
+                if let Some(cost) = card.mana_cost {
+                    con.execute("INSERT OR REPLACE INTO scryfall_mana (id,face,cost) VALUES (?1,0,?2)", [&card.id, &cost])?;
                 }
 
-                for face in card.card_faces {
+                for keyword in  card.keywords {
+                    con.execute("INSERT OR REPLACE INTO scryfall_keywords (id, keyword) VALUES (?1, ?2)", [&card.id, &keyword])?;
+                }
+
+                for (id, face) in card.card_faces.iter().enumerate() {
                     let face_name = deunicode::deunicode(face.printed_name.as_ref().unwrap_or(&face.name)).to_ascii_lowercase();
-                    con.execute("INSERT OR IGNORE INTO scryfall_faces (id, name) VALUES (?1, ?2)", [&card.id, &face_name])?;
+                    con.execute("INSERT OR REPLACE INTO scryfall_faces (id, name) VALUES (?1, ?2)", [&card.id, &face_name])?;
+                    con.execute("INSERT OR REPLACE INTO scryfall_mana (id,face,cost) VALUES (?1,?2,?3)", rusqlite::params![&card.id, id + 1, &face.mana_cost])?;
                 }
 
                 Ok(con)
